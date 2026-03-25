@@ -73,6 +73,48 @@ nohup python run_backtest.py --dynamic \
 tail -f backtest.log
 ```
 
+## Ubuntu/Debian 手动部署
+
+如果 `./setup.sh` 执行失败，请按以下步骤手动部署：
+
+```bash
+# 1. 安装系统依赖（根据Python版本调整，如python3.10-venv、python3.12-venv）
+sudo apt update
+sudo apt install -y python3.12-venv python3-pip
+
+# 2. 创建虚拟环境
+python3 -m venv venv
+
+# 3. 激活虚拟环境
+source venv/bin/activate
+
+# 4. 升级pip并安装依赖
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 5. 运行回测
+python run_backtest.py --dynamic --start 2026-01-01 --end 2026-01-30
+```
+
+### 常见问题
+
+**Q: 提示 `ensurepip is not available`**
+```bash
+# 安装对应版本的venv包
+sudo apt install python3.XX-venv  # XX替换为你的Python版本，如10、11、12
+```
+
+**Q: 查看Python版本**
+```bash
+python3 --version
+```
+
+**Q: 后台运行并查看日志**
+```bash
+nohup python run_backtest.py --dynamic --start 2026-01-01 --end 2026-01-30 > backtest.log 2>&1 &
+tail -f backtest.log
+```
+
 ## 命令参数
 
 | 参数 | 说明 | 默认值 |
