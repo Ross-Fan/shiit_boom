@@ -555,6 +555,90 @@ class DynamicWalkForwardSystem:
 
         return pd.Series(labels, index=df.index)
 
+    def _compute_features_by_symbol(self, df: pd.DataFrame) -> pd.DataFrame:
+        """按symbol分组计算特征（避免跨symbol计算，提高效率）"""
+        all_featured = []
+        symbols = df['symbol'].unique()
+        total = len(symbols)
+
+        for i, symbol in enumerate(symbols):
+            if (i + 1) % 50 == 0:
+                print(f"\r    特征计算进度: {i+1}/{total} ({symbol})", end='')
+                sys.stdout.flush()
+
+            symbol_df = df[df['symbol'] == symbol].copy()
+            if len(symbol_df) < self.config['windows'][-1] + 10:
+                continue
+
+            # 按时间排序
+            symbol_df = symbol_df.sort_values('minute').reset_index(drop=True)
+
+            # 计算特征
+            featured = self.feature_engine.compute(symbol_df)
+            all_featured.append(featured)
+
+        print()  # 换行
+        if not all_featured:
+            return pd.DataFrame()
+
+        return pd.concat(all_featured, ignore_index=True)
+
+    def _generate_labels_fast(self, df: pd.DataFrame) -> pd.Series:
+        """快速生成标签（按symbol分组处理）"""
+        tp = self.config['target_profit']
+        sl = self.config['stop_loss']
+        hold = self.config['hold_minutes']
+
+        labels = pd.Series(index=df.index, dtype=float)
+        labels[:] = np.nan
+
+        symbols = df['symbol'].unique()
+        total = len(symbols)
+
+        for i, symbol in enumerate(symbols):
+            if (i + 1) % 100 == 0:
+                print(f"\r    标签生成进度: {i+1}/{total}", end='')
+                sys.stdout.flush()
+
+            mask = df['symbol'] == symbol
+            symbol_df = df[mask]
+            idx = symbol_df.index
+
+            if len(symbol_df) <= hold:
+                continue
+
+            # 使用numpy加速
+            closes = symbol_df['close'].values
+            highs = symbol_df['high'].values
+            lows = symbol_df['low'].values
+
+            symbol_labels = []
+            for j in range(len(symbol_df)):
+                if j + hold >= len(symbol_df):
+                    symbol_labels.append(np.nan)
+                    continue
+
+                entry = closes[j]
+                label = 0
+
+                for k in range(1, hold + 1):
+                    high_ret = (highs[j + k] - entry) / entry * 100
+                    low_ret = (lows[j + k] - entry) / entry * 100
+
+                    if high_ret >= tp:
+                        label = 1
+                        break
+                    if low_ret <= sl:
+                        label = 0
+                        break
+
+                symbol_labels.append(label)
+
+            labels.loc[idx] = symbol_labels
+
+        print()  # 换行
+        return labels
+
     def train_model(self, X: pd.DataFrame, y: pd.Series, warm_start: bool = False) -> Dict:
         """训练模型"""
         if not HAS_LGB:
@@ -825,6 +909,8 @@ class DynamicWalkForwardSystem:
                 continue
 
             # 累积数据
+            print(f"\n  合并数据中...")
+            sys.stdout.flush()
             new_train_data = pd.concat(new_train_data_list, ignore_index=True)
 
             if cumulative_train_data is None:
@@ -835,12 +921,18 @@ class DynamicWalkForwardSystem:
                     ignore_index=True
                 )
 
-            print(f"\n  累积训练数据: {len(cumulative_train_data)} 条")
+            print(f"  累积训练数据: {len(cumulative_train_data)} 条")
             print(f"  累积合约数: {len(all_train_contracts)}")
+            sys.stdout.flush()
 
-            # 计算特征
-            train_featured = self.feature_engine.compute(cumulative_train_data)
-            train_featured['label'] = self.generate_labels(train_featured)
+            # 计算特征（按symbol分组处理，避免跨symbol计算）
+            print(f"\n  计算特征中（这可能需要几分钟）...")
+            sys.stdout.flush()
+            train_featured = self._compute_features_by_symbol(cumulative_train_data)
+
+            print(f"  生成标签中...")
+            sys.stdout.flush()
+            train_featured['label'] = self._generate_labels_fast(train_featured)
             train_valid = train_featured.dropna(subset=['label'] + self.feature_engine.feature_names)
 
             if len(train_valid) < 100:
@@ -914,7 +1006,9 @@ class DynamicWalkForwardSystem:
             test_data = pd.concat(test_data_list, ignore_index=True)
 
             # 计算特征
-            test_featured = self.feature_engine.compute(test_data)
+            print(f"  计算验证数据特征...")
+            sys.stdout.flush()
+            test_featured = self._compute_features_by_symbol(test_data)
             test_valid = test_featured.dropna(subset=self.feature_engine.feature_names)
 
             # 执行验证
