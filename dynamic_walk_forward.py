@@ -34,6 +34,7 @@ import json
 import zipfile
 import requests
 import time
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Set
@@ -249,7 +250,7 @@ class DataDownloader:
         self.session.headers.update({'User-Agent': 'Mozilla/5.0'})
         self.data_base = "https://data.binance.vision/data/futures/um/daily"
 
-    def download_aggTrades(self, symbol: str, date: str) -> Optional[Path]:
+    def download_aggTrades(self, symbol: str, date: str, timeout: int = 60) -> Optional[Path]:
         """下载aggTrades数据"""
         filename = f"{symbol}-aggTrades-{date}.zip"
         url = f"{self.data_base}/aggTrades/{symbol}/{filename}"
@@ -265,20 +266,38 @@ class DataDownloader:
             return csv_path
 
         try:
-            resp = self.session.get(url, timeout=120)
+            # 使用流式下载，设置超时
+            resp = self.session.get(url, timeout=timeout, stream=True)
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
 
+            # 写入文件
             with open(zip_path, 'wb') as f:
-                f.write(resp.content)
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
 
+            # 解压
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 zf.extractall(local_dir)
 
             zip_path.unlink()
             return csv_path
-        except Exception as e:
+
+        except requests.exceptions.Timeout:
+            if zip_path.exists():
+                zip_path.unlink()
+            return None
+        except requests.exceptions.RequestException:
+            if zip_path.exists():
+                zip_path.unlink()
+            return None
+        except zipfile.BadZipFile:
+            if zip_path.exists():
+                zip_path.unlink()
+            return None
+        except Exception:
             if zip_path.exists():
                 zip_path.unlink()
             return None
@@ -433,36 +452,65 @@ class DynamicWalkForwardSystem:
     def download_and_load_data(
         self,
         contracts: List[DailyContractInfo],
-        show_progress: bool = True
+        show_progress: bool = True,
+        max_workers: int = 10
     ) -> pd.DataFrame:
-        """下载并加载合约数据"""
+        """下载并加载合约数据（并行下载）"""
+        if not contracts:
+            return pd.DataFrame()
+
         all_data = []
+        failed_downloads = []
+        success_count = 0
+        total = len(contracts)
 
-        for i, contract in enumerate(contracts):
-            if show_progress:
-                print(f"\r    下载: {i+1}/{len(contracts)} {contract.symbol}", end='')
+        def download_one(contract):
+            """下载单个合约"""
+            csv_path = self.downloader.download_aggTrades(contract.symbol, contract.date, timeout=60)
+            return contract, csv_path
 
-            # 下载
-            csv_path = self.downloader.download_aggTrades(contract.symbol, contract.date)
-            if csv_path is None:
-                continue
+        # 并行下载
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(download_one, c): c for c in contracts}
 
-            contract.data_path = str(csv_path)
+            for future in as_completed(futures):
+                contract = futures[future]
+                try:
+                    contract, csv_path = future.result(timeout=90)
 
-            # 加载
-            cache_key = f"{contract.symbol}_{contract.date}"
-            if cache_key in self._minute_data_cache:
-                df = self._minute_data_cache[cache_key]
-            else:
-                df = self.downloader.load_csv_to_minutes(csv_path)
-                if not df.empty:
-                    self._minute_data_cache[cache_key] = df
+                    if csv_path is not None:
+                        contract.data_path = str(csv_path)
 
-            if not df.empty:
-                all_data.append(df)
+                        # 加载数据
+                        cache_key = f"{contract.symbol}_{contract.date}"
+                        if cache_key in self._minute_data_cache:
+                            df = self._minute_data_cache[cache_key]
+                        else:
+                            df = self.downloader.load_csv_to_minutes(csv_path)
+                            if not df.empty:
+                                self._minute_data_cache[cache_key] = df
+
+                        if not df.empty:
+                            all_data.append(df)
+                            success_count += 1
+                    else:
+                        failed_downloads.append(contract.symbol)
+
+                except Exception as e:
+                    failed_downloads.append(contract.symbol)
+
+                # 更新进度
+                if show_progress:
+                    done = success_count + len(failed_downloads)
+                    print(f"\r    下载进度: {done}/{total} (成功: {success_count}, 失败: {len(failed_downloads)})", end='')
+                    sys.stdout.flush()
 
         if show_progress:
-            print()
+            print()  # 换行
+            if failed_downloads and len(failed_downloads) <= 10:
+                print(f"    下载失败的合约: {failed_downloads}")
+            elif failed_downloads:
+                print(f"    下载失败: {len(failed_downloads)} 个合约")
 
         if not all_data:
             return pd.DataFrame()
