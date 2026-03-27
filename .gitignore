@@ -58,6 +58,7 @@ output/
 .cache/
 *.sqlite
 *.db
+volume_cache.json
 
 # 临时文件
 tmp/

@@ -74,6 +74,10 @@ DEFAULT_CONFIG = {
     # 滚动验证
     'train_days': 10,
     'test_days': 10,
+
+    # 内存控制（新增）
+    'max_symbols_per_day': 100,  # 每天最多处理的合约数（0=不限制）
+    'sample_ratio': 1.0,         # 数据采样比例（1.0=全量，0.5=50%）
 }
 
 
@@ -127,16 +131,49 @@ class PeriodResult:
 class ContractFilter:
     """合约筛选器 - 通过API获取符合条件的合约"""
 
-    def __init__(self, min_volume: float, max_volume: float):
+    def __init__(self, min_volume: float, max_volume: float, cache_dir: str = None):
         self.min_volume = min_volume
         self.max_volume = max_volume
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': 'Mozilla/5.0'})
         self.fapi_base = "https://fapi.binance.com"
 
-        # 缓存
+        # 缓存目录（用于持久化）
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # 内存缓存
         self._all_symbols_cache = None
         self._volume_cache: Dict[str, Dict[str, float]] = {}  # {date: {symbol: volume}}
+
+        # 加载磁盘缓存
+        self._load_volume_cache()
+
+    def _load_volume_cache(self):
+        """从磁盘加载交易量缓存"""
+        if not self.cache_dir:
+            return
+        cache_file = self.cache_dir / 'volume_cache.json'
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    self._volume_cache = json.load(f)
+                print(f"  已加载交易量缓存: {len(self._volume_cache)} 天")
+            except Exception as e:
+                print(f"  加载缓存失败: {e}")
+                self._volume_cache = {}
+
+    def _save_volume_cache(self):
+        """保存交易量缓存到磁盘"""
+        if not self.cache_dir:
+            return
+        cache_file = self.cache_dir / 'volume_cache.json'
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(self._volume_cache, f)
+        except Exception as e:
+            print(f"  保存缓存失败: {e}")
 
     def get_all_symbols(self) -> List[str]:
         """获取所有USDT永续合约"""
@@ -205,10 +242,26 @@ class ContractFilter:
         max_workers: int = 20,
         progress_callback=None
     ) -> List[DailyContractInfo]:
-        """筛选指定日期符合条件的合约"""
+        """筛选指定日期符合条件的合约（带磁盘缓存）"""
         all_symbols = self.get_all_symbols()
         if not all_symbols:
             return []
+
+        # 检查缓存是否已有该日期的完整数据
+        if date in self._volume_cache:
+            cached_data = self._volume_cache[date]
+            # 如果缓存的合约数量接近总数（>90%），认为是完整缓存
+            if len(cached_data) > len(all_symbols) * 0.9:
+                print(f"    使用缓存数据 ({len(cached_data)} 个合约)")
+                results = []
+                for symbol, volume in cached_data.items():
+                    if volume is not None and self.min_volume <= volume <= self.max_volume:
+                        results.append(DailyContractInfo(
+                            date=date,
+                            symbol=symbol,
+                            volume_usdt=volume
+                        ))
+                return sorted(results, key=lambda x: x.volume_usdt, reverse=True)
 
         results = []
         checked = 0
@@ -233,6 +286,9 @@ class ContractFilter:
 
                 if progress_callback and checked % 50 == 0:
                     progress_callback(checked, len(all_symbols), len(results))
+
+        # 保存缓存到磁盘
+        self._save_volume_cache()
 
         return sorted(results, key=lambda x: x.volume_usdt, reverse=True)
 
@@ -409,10 +465,14 @@ class DynamicWalkForwardSystem:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.data_dir = Path(data_dir) if data_dir else Path('data')
 
+        # 缓存目录
+        cache_dir = self.data_dir / '.cache'
+
         # 组件
         self.contract_filter = ContractFilter(
             self.config['min_volume_usdt'],
-            self.config['max_volume_usdt']
+            self.config['max_volume_usdt'],
+            cache_dir=str(cache_dir)
         )
         self.downloader = DataDownloader(str(self.data_dir))
         self.feature_engine = FeatureEngine(self.config['windows'])
@@ -455,19 +515,24 @@ class DynamicWalkForwardSystem:
         show_progress: bool = True,
         max_workers: int = 10
     ) -> pd.DataFrame:
-        """下载并加载合约数据（并行下载）"""
+        """下载并加载合约数据（并行下载，自动跳过已存在的文件）"""
         if not contracts:
             return pd.DataFrame()
 
         all_data = []
         failed_downloads = []
         success_count = 0
+        skipped_count = 0  # 跳过的文件计数
         total = len(contracts)
 
         def download_one(contract):
-            """下载单个合约"""
-            csv_path = self.downloader.download_aggTrades(contract.symbol, contract.date, timeout=60)
-            return contract, csv_path
+            """下载单个合约，返回(contract, csv_path, was_skipped)"""
+            # 检查文件是否已存在
+            csv_path = self.data_dir / contract.symbol / f"{contract.symbol}-aggTrades-{contract.date}.csv"
+            was_skipped = csv_path.exists()
+
+            result_path = self.downloader.download_aggTrades(contract.symbol, contract.date, timeout=60)
+            return contract, result_path, was_skipped
 
         # 并行下载
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -476,7 +541,7 @@ class DynamicWalkForwardSystem:
             for future in as_completed(futures):
                 contract = futures[future]
                 try:
-                    contract, csv_path = future.result(timeout=90)
+                    contract, csv_path, was_skipped = future.result(timeout=90)
 
                     if csv_path is not None:
                         contract.data_path = str(csv_path)
@@ -493,20 +558,24 @@ class DynamicWalkForwardSystem:
                         if not df.empty:
                             all_data.append(df)
                             success_count += 1
+                            if was_skipped:
+                                skipped_count += 1
                     else:
                         failed_downloads.append(contract.symbol)
 
                 except Exception as e:
                     failed_downloads.append(contract.symbol)
 
-                # 更新进度
+                # 更新进度（显示跳过数量）
                 if show_progress:
                     done = success_count + len(failed_downloads)
-                    print(f"\r    下载进度: {done}/{total} (成功: {success_count}, 失败: {len(failed_downloads)})", end='')
+                    print(f"\r    加载进度: {done}/{total} (成功: {success_count}, 跳过: {skipped_count}, 失败: {len(failed_downloads)})", end='')
                     sys.stdout.flush()
 
         if show_progress:
             print()  # 换行
+            if skipped_count > 0:
+                print(f"    已跳过 {skipped_count} 个已存在的文件")
             if failed_downloads and len(failed_downloads) <= 10:
                 print(f"    下载失败的合约: {failed_downloads}")
             elif failed_downloads:
@@ -555,15 +624,17 @@ class DynamicWalkForwardSystem:
 
         return pd.Series(labels, index=df.index)
 
-    def _compute_features_by_symbol(self, df: pd.DataFrame) -> pd.DataFrame:
-        """按symbol分组计算特征（避免跨symbol计算，提高效率）"""
+    def _compute_features_by_symbol(self, df: pd.DataFrame, batch_size: int = 50) -> pd.DataFrame:
+        """按symbol分组计算特征（分批处理，避免内存溢出）"""
+        import gc
+
         all_featured = []
         symbols = df['symbol'].unique()
         total = len(symbols)
 
         for i, symbol in enumerate(symbols):
-            if (i + 1) % 50 == 0:
-                print(f"\r    特征计算进度: {i+1}/{total} ({symbol})", end='')
+            if (i + 1) % 20 == 0:
+                print(f"\r    特征计算进度: {i+1}/{total}", end='')
                 sys.stdout.flush()
 
             symbol_df = df[df['symbol'] == symbol].copy()
@@ -577,14 +648,29 @@ class DynamicWalkForwardSystem:
             featured = self.feature_engine.compute(symbol_df)
             all_featured.append(featured)
 
+            # 每处理batch_size个symbol，清理内存
+            if (i + 1) % batch_size == 0:
+                gc.collect()
+
         print()  # 换行
+        gc.collect()
+
         if not all_featured:
             return pd.DataFrame()
 
-        return pd.concat(all_featured, ignore_index=True)
+        # 分批合并，避免一次性合并占用太多内存
+        print(f"    合并特征数据...")
+        sys.stdout.flush()
+        result = pd.concat(all_featured, ignore_index=True)
+        del all_featured
+        gc.collect()
 
-    def _generate_labels_fast(self, df: pd.DataFrame) -> pd.Series:
+        return result
+
+    def _generate_labels_fast(self, df: pd.DataFrame, batch_size: int = 100) -> pd.Series:
         """快速生成标签（按symbol分组处理）"""
+        import gc
+
         tp = self.config['target_profit']
         sl = self.config['stop_loss']
         hold = self.config['hold_minutes']
@@ -596,7 +682,7 @@ class DynamicWalkForwardSystem:
         total = len(symbols)
 
         for i, symbol in enumerate(symbols):
-            if (i + 1) % 100 == 0:
+            if (i + 1) % 50 == 0:
                 print(f"\r    标签生成进度: {i+1}/{total}", end='')
                 sys.stdout.flush()
 
@@ -636,7 +722,12 @@ class DynamicWalkForwardSystem:
 
             labels.loc[idx] = symbol_labels
 
+            # 定期清理内存
+            if (i + 1) % batch_size == 0:
+                gc.collect()
+
         print()  # 换行
+        gc.collect()
         return labels
 
     def train_model(self, X: pd.DataFrame, y: pd.Series, warm_start: bool = False) -> Dict:
@@ -890,7 +981,14 @@ class DynamicWalkForwardSystem:
                 print(f"\n  [{date_str}] 筛选合约...")
 
                 contracts = self.get_contracts_for_date(date_str)
-                print(f"    找到 {len(contracts)} 个符合条件的合约")
+
+                # 应用合约数量限制
+                max_symbols = self.config.get('max_symbols_per_day', 0)
+                if max_symbols > 0 and len(contracts) > max_symbols:
+                    contracts = contracts[:max_symbols]  # 已按交易量排序，取前N个
+                    print(f"    找到 {len(contracts)} 个合约（限制为前 {max_symbols} 个）")
+                else:
+                    print(f"    找到 {len(contracts)} 个符合条件的合约")
 
                 if contracts:
                     print(f"    下载数据...")
@@ -969,6 +1067,12 @@ class DynamicWalkForwardSystem:
                 print(f"\n  [{date_str}] 筛选验证期合约...")
 
                 contracts = self.get_contracts_for_date(date_str)
+
+                # 应用合约数量限制
+                max_symbols = self.config.get('max_symbols_per_day', 0)
+                if max_symbols > 0 and len(contracts) > max_symbols:
+                    contracts = contracts[:max_symbols]
+
                 print(f"    找到 {len(contracts)} 个符合条件的合约")
 
                 # 统计和训练期的重叠
